@@ -7,23 +7,24 @@
 #include <signal.h>
 #include <stdio.h>
 #include <wait.h>
+#include <fcntl.h>
 #include <errno.h>
-#include <sched.h>
 #include <assert.h>
+#include <string.h>
+#include <sched.h>
 
+#include "banking.h"
+#include "pa2345.h"
 #include "common.h"
 #include "ipc.h"
-#include "pa1.h"
 
-
-// c99 limitation
-int kill(pid_t pid, int sig);
 
 struct ipc {
     local_id n;
     pid_t pid;
     pid_t ppid;
     local_id id;
+    balance_t balance;
     FILE * const events_log;
 
     struct {
@@ -32,17 +33,41 @@ struct ipc {
     } pipes[MAX_PROCESS_ID + 1];
 };
 
-static bool parse_args(int argc, char * argv[], local_id * n) {
+// c99 limitation
+int kill(pid_t pid, int sig);
+
+
+static bool parse_args(int argc, char * argv[], local_id * n, balance_t ** balances) {
     int opt;
 
+    local_id x;
+    bool p = false;
     while ((opt = getopt(argc, argv, "p:")) > 0) {
         if (opt == 'p') {
-            *n = (local_id) (atoi(optarg) + 1);
-            return true;
+            x = (local_id) atoi(optarg);
+            p = true;
         }
     }
 
-    return false;
+    if (!p) {
+        return false;
+    }
+
+    if (argc - optind < x) {
+        return false;
+    }
+
+    *balances = malloc(sizeof(**balances) * *n);
+    if (!*balances) {
+        return false;
+    }
+
+    *n = x + 1;
+    for (int i = 0; i < x; ++i, ++optind) {
+        (*balances)[i] = atoi(argv[optind]);
+    }
+
+    return true;
 }
 
 static bool open_pipes(int n, int ** in, int ** out) {
@@ -201,10 +226,9 @@ static void log_msg(FILE * log_file, const char * format, ...) {
 static int subprocess_main(struct ipc ipc) {
     int ret = 0;
 
-    log_msg(ipc.events_log, log_started_fmt, ipc.id, ipc.pid, ipc.ppid);
+    log_msg(ipc.events_log, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance);
 
-    if (!send_printf_message_multicast(&ipc, STARTED, log_started_fmt, ipc.id, ipc.pid, ipc.ppid)) {
-        perror("Error in subprocess (1)");
+    if (!send_printf_message_multicast(&ipc, STARTED, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance)) {
         ret = 1;
         goto end;
     }
@@ -216,7 +240,6 @@ static int subprocess_main(struct ipc ipc) {
 
         Message msg;
         if (receive(&ipc, id, &msg) < 0) {
-            perror("Error in subprocess (2)");
             ret = 2;
             goto end;
         }
@@ -224,32 +247,106 @@ static int subprocess_main(struct ipc ipc) {
         assert(msg.s_header.s_type == STARTED);
     }
 
-    log_msg(ipc.events_log, log_received_all_started_fmt, ipc.id);
+    log_msg(ipc.events_log, log_received_all_started_fmt, get_physical_time(), ipc.id);
 
-    log_msg(ipc.events_log, log_done_fmt, ipc.id);
-
-    if (!send_printf_message_multicast(&ipc, DONE, log_done_fmt, ipc.id)) {
-        perror("Error in subprocess (3)");
-        ret = 3;
-        goto end;
-    }
-
-    for (local_id id = 1; id < ipc.n; ++id) {
-        if (id == ipc.id) {
-            continue;
-        }
-
+    size_t done = 1;
+    bool current_done = false;
+    BalanceHistory history = { .s_id = ipc.id, .s_history_len = 0 };
+    while (true) {
         Message msg;
-        if (receive(&ipc, id, &msg) < 0) {
-            perror("Error in subprocess (2)");
-            ret = 2;
+
+        if (receive_any(&ipc, &msg) != 0) {
+            ret = 3;
             goto end;
         }
 
-        assert(msg.s_header.s_type == DONE);
+        const timestamp_t t = get_physical_time();
+        for (timestamp_t i = history.s_history_len; i < t; ++i) {
+            history.s_history[i].s_time = i;
+            history.s_history[i].s_balance = ipc.balance;
+            history.s_history[i].s_balance_pending_in = 0;
+        }
+
+        history.s_history_len = t;
+
+        switch (msg.s_header.s_type) {
+            case TRANSFER: {
+                const TransferOrder * const transfer = (TransferOrder *) msg.s_payload;
+
+                assert((!current_done && ipc.id == transfer->s_src) || ipc.id == transfer->s_dst);
+
+                if (ipc.id == transfer->s_src) {
+                    ipc.balance -= transfer->s_amount;
+
+                    if (send(&ipc, transfer->s_dst, &msg) != 0) {
+                        ret = 4;
+                        goto end;
+                    }
+
+                    log_msg(ipc.events_log, log_transfer_out_fmt, t, ipc.id, transfer->s_amount, transfer->s_dst);
+                } else {
+                    log_msg(ipc.events_log, log_transfer_in_fmt, t, ipc.id, transfer->s_amount, transfer->s_src);
+
+                    ipc.balance += transfer->s_amount;
+
+                    Message ack = { 0 };
+                    ack.s_header.s_magic = MESSAGE_MAGIC;
+                    ack.s_header.s_type = ACK;
+                    ack.s_header.s_payload_len = 0;
+
+                    if (send(&ipc, PARENT_ID, &ack) != 0) {
+                        ret = 5;
+                        goto end;
+                    }
+                }
+
+                break;
+            }
+
+            case STOP:
+                assert(!current_done);
+
+                current_done = true;
+                ++done;
+
+                log_msg(ipc.events_log, log_done_fmt, get_physical_time(), ipc.id, ipc.balance);
+                if (!send_printf_message_multicast(&ipc, DONE, log_done_fmt, get_physical_time(), ipc.id, ipc.balance)) {
+                    ret = 6;
+                    goto end;
+                }
+
+                break;
+
+            case DONE:
+                ++done;
+
+                if (done == ipc.n) {
+                    goto break_while;
+                }
+
+                break;
+        }
     }
 
-    log_msg(ipc.events_log, log_received_all_done_fmt, ipc.id);
+break_while: ;
+    history.s_history[history.s_history_len].s_time = history.s_history_len;
+    history.s_history[history.s_history_len].s_balance = ipc.balance;
+    history.s_history[history.s_history_len].s_balance_pending_in = 0;
+    ++history.s_history_len;
+
+    Message msg = { 0 };
+
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_type = BALANCE_HISTORY;
+    msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) + sizeof(BalanceState) * history.s_history_len;
+    memcpy(msg.s_payload, &history, msg.s_header.s_payload_len);
+
+    if (send(&ipc, PARENT_ID, &msg) != 0) {
+        ret = 7;
+        goto end;
+    }
+
+    log_msg(ipc.events_log, log_received_all_done_fmt, get_physical_time(), ipc.id);
 
 end:
     close_pipes(&ipc);
@@ -257,7 +354,7 @@ end:
     return ret;
 }
 
-static bool start_processes(local_id n, struct ipc * ipc, pid_t ** pids) {
+static bool start_processes(local_id n, struct ipc * ipc, pid_t ** pids, const balance_t * balances) {
     *pids = malloc(n * sizeof(pid_t));
 
     if (!*pids) {
@@ -291,6 +388,7 @@ static bool start_processes(local_id n, struct ipc * ipc, pid_t ** pids) {
                 .n = n,
                 .pid = getpid(),
                 .ppid = parent_pid,
+                .balance = balances[i - 1],
                 .id = (local_id) i,
                 .events_log = events_log_file,
             };
@@ -332,7 +430,7 @@ free_pids:
     return false;
 }
 
-static bool await_processes(struct ipc * ipc, const pid_t * pids) {
+static bool main_work(struct ipc * ipc, const pid_t * pids) {
     for (local_id id = 1; id < ipc->n; ++id) {
         Message msg;
 
@@ -341,6 +439,20 @@ static bool await_processes(struct ipc * ipc, const pid_t * pids) {
         }
 
         assert(msg.s_header.s_type == STARTED);
+    }
+
+    bank_robbery(ipc, ipc->n - 1);
+
+    {
+        Message msg = { 0 };
+
+        msg.s_header.s_magic = MESSAGE_MAGIC;
+        msg.s_header.s_type = STOP;
+        msg.s_header.s_payload_len = 0;
+
+        if (send_multicast(ipc, &msg) < 0) {
+            return false;
+        }
     }
 
     for (local_id id = 1; id < ipc->n; ++id) {
@@ -352,6 +464,30 @@ static bool await_processes(struct ipc * ipc, const pid_t * pids) {
 
         assert(msg.s_header.s_type == DONE);
     }
+
+    AllHistory allHistory;
+    allHistory.s_history_len = ipc->n - 1;
+
+    for (local_id id = 1; id < ipc->n; ++id) {
+        Message msg;
+
+        if (receive(ipc, id, &msg) < 0) {
+            return false;
+        }
+
+        assert(msg.s_header.s_type == BALANCE_HISTORY);
+
+        const BalanceHistory * const history = (BalanceHistory *) msg.s_payload;
+
+        allHistory.s_history[id - 1].s_id = history->s_id;
+        allHistory.s_history[id - 1].s_history_len = history->s_history_len;
+
+        for (size_t i = 0; i < history->s_history_len; ++i) {
+            allHistory.s_history[id - 1].s_history[i] = history->s_history[i];
+        }
+    }
+
+    print_history(&allHistory);
 
     for (int i = 1; i < ipc->n; ++i) {
         if (waitpid(pids[i], NULL, 0) < 0) {
@@ -369,26 +505,30 @@ static bool await_processes(struct ipc * ipc, const pid_t * pids) {
 int main(int argc, char * argv[]) {
     local_id n;
 
-    if (!parse_args(argc, argv, &n)) {
+    balance_t * balances;
+    if (!parse_args(argc, argv, &n, &balances)) {
         return 1;
     }
 
     pid_t * pids;
     struct ipc ipc;
-    if (!start_processes(n, &ipc, &pids)) {
+    if (!start_processes(n, &ipc, &pids, balances)) {
         perror("Cannot create processes");
+        free(balances);
         return 2;
     }
 
-    if (!await_processes(&ipc, pids)) {
+    if (!main_work(&ipc, pids)) {
         perror("Error");
         close_pipes(&ipc);
         free(pids);
+        free(balances);
         return 3;
     }
 
     close_pipes(&ipc);
     free(pids);
+    free(balances);
     return 0;
 }
 
@@ -440,9 +580,14 @@ static bool read_full(int fd, void * buf, size_t remaining) {
     ssize_t bytes_read;
 
     errno = 0;
-    while ((bytes_read = read(fd, ptr, remaining)) > 0) {
+    while ((bytes_read = read(fd, ptr, remaining)) >= 0) {
         remaining -= bytes_read;
         ptr += bytes_read;
+
+        if (bytes_read == 0 && ptr != buf) {
+            sched_yield();
+            continue;
+        }
 
         if (remaining == 0) {
             return true;
@@ -473,6 +618,30 @@ int receive(void * self, local_id from, Message * msg) {
 int receive_any(void * self, Message * msg) {
     struct ipc * const ipc = self;
 
+    int * const flags = malloc(sizeof(*flags) * ipc->n);
+    if (!flags) {
+        return -1;
+    }
+
+    for (local_id id = 0; id < ipc->n; ++id) {
+        const int fd = ipc->pipes[id].in;
+
+        if (fd < 0) {
+            continue;
+        }
+
+        flags[id] = fcntl(fd, F_GETFL);
+        if (flags[id] == -1) {
+            free(flags);
+            return -1;
+        }
+
+        if (fcntl(fd, F_SETFL, flags[id] | O_NONBLOCK) != 0) {
+            free(flags);
+            return -1;
+        }
+    }
+
     while (true) {
         for (local_id id = 0; id < ipc->n; ++id) {
             if (id == ipc->id) {
@@ -480,15 +649,51 @@ int receive_any(void * self, Message * msg) {
             }
 
             if (receive(ipc, id, msg) == 0) {
-                return 0;
+                goto break_while;
             }
 
             if (errno != EPIPE && errno != EWOULDBLOCK && errno != EAGAIN) {
-                perror("ERROR receive_any");
+                free(flags);
                 return -1;
             }
+        }
 
-            sched_yield();
+        sleep(1);
+    }
+
+break_while:
+    for (local_id id = 0; id < ipc->n; ++id) {
+        const int fd = ipc->pipes[id].in;
+
+        if (fd < 0) {
+            continue;
+        }
+
+        if (fcntl(fd, F_SETFL, flags[id]) != 0) {
+            free(flags);
+            return -1;
         }
     }
+
+    free(flags);
+    return 0;
+}
+
+void transfer(void * parent_data, local_id src, local_id dst, balance_t amount) {
+    const struct ipc * ipc = parent_data;
+
+    assert(ipc->id == PARENT_ID);
+
+    Message msg;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_type = TRANSFER;
+    msg.s_header.s_payload_len = sizeof(TransferOrder);
+    TransferOrder * const transfer = (TransferOrder *) msg.s_payload;
+    transfer->s_src = src;
+    transfer->s_dst = dst;
+    transfer->s_amount = amount;
+    send(parent_data, src, &msg);
+
+    receive(parent_data, dst, &msg);
+    assert(msg.s_header.s_type == ACK);
 }
