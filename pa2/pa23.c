@@ -70,6 +70,20 @@ static bool parse_args(int argc, char * argv[], local_id * n, balance_t ** balan
     return true;
 }
 
+static bool make_nonblock(int fd) {
+    const int flag = fcntl(fd, F_GETFL);
+
+    if (flag == -1) {
+        return false;
+    }
+
+    if (fcntl(fd, F_SETFL, flag | O_NONBLOCK) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool open_pipes(int n, int ** in, int ** out) {
     *in = malloc(n * n * sizeof(int));
 
@@ -97,6 +111,14 @@ static bool open_pipes(int n, int ** in, int ** out) {
                 int pipefd[2];
 
                 if (pipe(pipefd) < 0) {
+                    goto close_pipes;
+                }
+
+                if (!make_nonblock(pipefd[0])) {
+                    goto close_pipes;
+                }
+
+                if (!make_nonblock(pipefd[1])) {
                     goto close_pipes;
                 }
 
@@ -218,9 +240,28 @@ static void log_msg(FILE * log_file, const char * format, ...) {
     vprintf(format, ap);
     va_end(ap);
 
+    fflush(stdout);
+
     va_start(ap, format);
     vfprintf(log_file, format, ap);
     va_end(ap);
+
+    fflush(log_file);
+}
+
+static int receive_blocking(const struct ipc * ipc, local_id id, Message * msg) {
+    while (true) {
+        const int ret = receive((void *) ipc, id, msg);
+
+        if (ret != 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                sched_yield();
+                continue;
+            }
+        }
+
+        return ret;
+    }
 }
 
 static int subprocess_main(struct ipc ipc) {
@@ -239,7 +280,7 @@ static int subprocess_main(struct ipc ipc) {
         }
 
         Message msg;
-        if (receive(&ipc, id, &msg) < 0) {
+        if (receive_blocking(&ipc, id, &msg) < 0) {
             ret = 2;
             goto end;
         }
@@ -289,7 +330,7 @@ static int subprocess_main(struct ipc ipc) {
 
                     ipc.balance += transfer->s_amount;
 
-                    Message ack = { 0 };
+                    Message ack;
                     ack.s_header.s_magic = MESSAGE_MAGIC;
                     ack.s_header.s_type = ACK;
                     ack.s_header.s_payload_len = 0;
@@ -334,8 +375,7 @@ break_while: ;
     history.s_history[history.s_history_len].s_balance_pending_in = 0;
     ++history.s_history_len;
 
-    Message msg = { 0 };
-
+    Message msg;
     msg.s_header.s_magic = MESSAGE_MAGIC;
     msg.s_header.s_type = BALANCE_HISTORY;
     msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) + sizeof(BalanceState) * history.s_history_len;
@@ -434,7 +474,7 @@ static bool main_work(struct ipc * ipc, const pid_t * pids) {
     for (local_id id = 1; id < ipc->n; ++id) {
         Message msg;
 
-        if (receive(ipc, id, &msg) < 0) {
+        if (receive_blocking(ipc, id, &msg) < 0) {
             return false;
         }
 
@@ -444,7 +484,7 @@ static bool main_work(struct ipc * ipc, const pid_t * pids) {
     bank_robbery(ipc, ipc->n - 1);
 
     {
-        Message msg = { 0 };
+        Message msg;
 
         msg.s_header.s_magic = MESSAGE_MAGIC;
         msg.s_header.s_type = STOP;
@@ -458,7 +498,7 @@ static bool main_work(struct ipc * ipc, const pid_t * pids) {
     for (local_id id = 1; id < ipc->n; ++id) {
         Message msg;
 
-        if (receive(ipc, id, &msg) < 0) {
+        if (receive_blocking(ipc, id, &msg) < 0) {
             return false;
         }
 
@@ -471,7 +511,7 @@ static bool main_work(struct ipc * ipc, const pid_t * pids) {
     for (local_id id = 1; id < ipc->n; ++id) {
         Message msg;
 
-        if (receive(ipc, id, &msg) < 0) {
+        if (receive_blocking(ipc, id, &msg) < 0) {
             return false;
         }
 
@@ -534,10 +574,24 @@ int main(int argc, char * argv[]) {
 
 static bool write_full(int fd, const void * buf, size_t remaining) {
     const uint8_t * ptr = buf;
-    ssize_t wrote;
+
+    if (remaining == 0) {
+        return true;
+    }
 
     errno = 0;
-    while ((wrote = write(fd, ptr, remaining)) >= 0) {
+    while (true) {
+        const ssize_t wrote = write(fd, ptr, remaining);
+
+        if (wrote < 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                sched_yield();
+                continue;
+            }
+
+            break;
+        }
+
         remaining -= wrote;
         ptr += wrote;
 
@@ -577,25 +631,40 @@ int send_multicast(void * self, const Message * msg) {
 
 static bool read_full(int fd, void * buf, size_t remaining) {
     uint8_t * ptr = buf;
-    ssize_t bytes_read;
+
+    if (remaining == 0) {
+        return true;
+    }
 
     errno = 0;
-    while ((bytes_read = read(fd, ptr, remaining)) >= 0) {
+    while (true) {
+        const ssize_t bytes_read = read(fd, ptr, remaining);
+
+        if (bytes_read < 0) {
+            if (ptr != buf) {
+                if (errno == EWOULDBLOCK || errno == EPIPE) {
+                    sched_yield();
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        if (bytes_read == 0) {
+            if (errno == 0) {
+                errno = EPIPE;
+            }
+
+            break;
+        }
+
         remaining -= bytes_read;
         ptr += bytes_read;
-
-        if (bytes_read == 0 && ptr != buf) {
-            sched_yield();
-            continue;
-        }
 
         if (remaining == 0) {
             return true;
         }
-    }
-
-    if (bytes_read == 0 && errno == 0) {
-        errno = EPIPE;
     }
 
     return false;
@@ -608,39 +677,21 @@ int receive(void * self, local_id from, Message * msg) {
         return -1;
     }
 
-    if (!read_full(ipc->pipes[from].in, msg->s_payload, msg->s_header.s_payload_len)) {
+    while (!read_full(ipc->pipes[from].in, msg->s_payload, msg->s_header.s_payload_len)) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            sched_yield();
+            continue;
+        }
+
         return -2;
     }
 
+    printf("aoaoao %d %d->%d\n", msg->s_header.s_type, from, ipc->id);
     return 0;
 }
 
 int receive_any(void * self, Message * msg) {
     struct ipc * const ipc = self;
-
-    int * const flags = malloc(sizeof(*flags) * ipc->n);
-    if (!flags) {
-        return -1;
-    }
-
-    for (local_id id = 0; id < ipc->n; ++id) {
-        const int fd = ipc->pipes[id].in;
-
-        if (fd < 0) {
-            continue;
-        }
-
-        flags[id] = fcntl(fd, F_GETFL);
-        if (flags[id] == -1) {
-            free(flags);
-            return -1;
-        }
-
-        if (fcntl(fd, F_SETFL, flags[id] | O_NONBLOCK) != 0) {
-            free(flags);
-            return -1;
-        }
-    }
 
     while (true) {
         for (local_id id = 0; id < ipc->n; ++id) {
@@ -649,34 +700,16 @@ int receive_any(void * self, Message * msg) {
             }
 
             if (receive(ipc, id, msg) == 0) {
-                goto break_while;
+                return 0;
             }
 
             if (errno != EPIPE && errno != EWOULDBLOCK && errno != EAGAIN) {
-                free(flags);
                 return -1;
             }
         }
 
-        sleep(1);
+        sched_yield();
     }
-
-break_while:
-    for (local_id id = 0; id < ipc->n; ++id) {
-        const int fd = ipc->pipes[id].in;
-
-        if (fd < 0) {
-            continue;
-        }
-
-        if (fcntl(fd, F_SETFL, flags[id]) != 0) {
-            free(flags);
-            return -1;
-        }
-    }
-
-    free(flags);
-    return 0;
 }
 
 void transfer(void * parent_data, local_id src, local_id dst, balance_t amount) {
@@ -694,6 +727,6 @@ void transfer(void * parent_data, local_id src, local_id dst, balance_t amount) 
     transfer->s_amount = amount;
     send(parent_data, src, &msg);
 
-    receive(parent_data, dst, &msg);
+    receive_blocking(parent_data, dst, &msg);
     assert(msg.s_header.s_type == ACK);
 }
