@@ -37,6 +37,8 @@ struct ipc {
 int kill(pid_t pid, int sig);
 
 
+static timestamp_t current_lamport_time = 0;
+
 static bool parse_args(int argc, char * argv[], local_id * n, balance_t ** balances) {
     int opt;
 
@@ -267,9 +269,9 @@ static int receive_blocking(const struct ipc * ipc, local_id id, Message * msg) 
 static int subprocess_main(struct ipc ipc) {
     int ret = 0;
 
-    log_msg(ipc.events_log, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance);
+    log_msg(ipc.events_log, log_started_fmt, get_lamport_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance);
 
-    if (!send_printf_message_multicast(&ipc, STARTED, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance)) {
+    if (!send_printf_message_multicast(&ipc, STARTED, log_started_fmt, get_lamport_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance)) {
         ret = 1;
         goto end;
     }
@@ -288,7 +290,7 @@ static int subprocess_main(struct ipc ipc) {
         assert(msg.s_header.s_type == STARTED);
     }
 
-    log_msg(ipc.events_log, log_received_all_started_fmt, get_physical_time(), ipc.id);
+    log_msg(ipc.events_log, log_received_all_started_fmt, get_lamport_time(), ipc.id);
 
     size_t done = 1;
     bool current_done = false;
@@ -301,7 +303,7 @@ static int subprocess_main(struct ipc ipc) {
             goto end;
         }
 
-        const timestamp_t t = get_physical_time();
+        const timestamp_t t = get_lamport_time();
         for (timestamp_t i = history.s_history_len; i < t; ++i) {
             history.s_history[i].s_time = i;
             history.s_history[i].s_balance = ipc.balance;
@@ -330,6 +332,10 @@ static int subprocess_main(struct ipc ipc) {
 
                     ipc.balance += transfer->s_amount;
 
+                    for (timestamp_t i = msg.s_header.s_local_time - 1; i < t; ++i) {
+                        history.s_history[i].s_balance_pending_in += transfer->s_amount;
+                    }
+
                     Message ack;
                     ack.s_header.s_magic = MESSAGE_MAGIC;
                     ack.s_header.s_type = ACK;
@@ -350,8 +356,8 @@ static int subprocess_main(struct ipc ipc) {
                 current_done = true;
                 ++done;
 
-                log_msg(ipc.events_log, log_done_fmt, get_physical_time(), ipc.id, ipc.balance);
-                if (!send_printf_message_multicast(&ipc, DONE, log_done_fmt, get_physical_time(), ipc.id, ipc.balance)) {
+                log_msg(ipc.events_log, log_done_fmt, get_lamport_time(), ipc.id, ipc.balance);
+                if (!send_printf_message_multicast(&ipc, DONE, log_done_fmt, get_lamport_time(), ipc.id, ipc.balance)) {
                     ret = 6;
                     goto end;
                 }
@@ -386,7 +392,7 @@ break_while: ;
         goto end;
     }
 
-    log_msg(ipc.events_log, log_received_all_done_fmt, get_physical_time(), ipc.id);
+    log_msg(ipc.events_log, log_received_all_done_fmt, get_lamport_time(), ipc.id);
 
 end:
     close_pipes(&ipc);
@@ -603,9 +609,7 @@ static bool write_full(int fd, const void * buf, size_t remaining) {
     return false;
 }
 
-int send(void * self, local_id dst, const Message * msg) {
-    struct ipc * const ipc = self;
-
+static int do_send(const struct ipc * ipc, local_id dst, const Message * msg) {
     if (!write_full(ipc->pipes[dst].out, msg, sizeof(MessageHeader) + msg->s_header.s_payload_len)) {
         return -1;
     }
@@ -613,15 +617,32 @@ int send(void * self, local_id dst, const Message * msg) {
     return 0;
 }
 
+static void prepare_to_send(const Message * msg, Message * new_msg) {
+    ++current_lamport_time;
+
+    new_msg->s_header = msg->s_header;
+    new_msg->s_header.s_local_time = current_lamport_time;
+    memcpy(new_msg->s_payload, msg->s_payload, msg->s_header.s_payload_len);
+}
+
+int send(void * self, local_id dst, const Message * msg) {
+    Message new_msg;
+
+    prepare_to_send(msg, &new_msg);
+    return do_send(self, dst, &new_msg);
+}
+
 int send_multicast(void * self, const Message * msg) {
     struct ipc * const ipc = self;
+    Message new_msg;
 
+    prepare_to_send(msg, &new_msg);
     for (local_id id = 0; id < ipc->n; ++id) {
         if (id == ipc->id) {
             continue;
         }
 
-        if (send(ipc, id, msg) != 0) {
+        if (do_send(ipc, id, &new_msg) != 0) {
             return -1;
         }
     }
@@ -686,6 +707,11 @@ int receive(void * self, local_id from, Message * msg) {
         return -2;
     }
 
+    if (current_lamport_time < msg->s_header.s_local_time) {
+        current_lamport_time = msg->s_header.s_local_time;
+    }
+
+    ++current_lamport_time;
     return 0;
 }
 
@@ -728,4 +754,8 @@ void transfer(void * parent_data, local_id src, local_id dst, balance_t amount) 
 
     receive_blocking(parent_data, dst, &msg);
     assert(msg.s_header.s_type == ACK);
+}
+
+timestamp_t get_lamport_time() {
+    return current_lamport_time;
 }
